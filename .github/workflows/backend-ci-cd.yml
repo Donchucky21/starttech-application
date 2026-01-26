@@ -35,6 +35,10 @@ jobs:
           cache: true
           cache-dependency-path: backend/MuchToDo/go.sum
 
+      - name: Download Go dependencies
+        run: |
+          go mod download
+
       - name: Go test
         run: |
           go test ./... -v
@@ -49,14 +53,11 @@ jobs:
         run: |
           golangci-lint run ./... --timeout=5m
 
-
       - name: Gosec (SAST)
-        uses: securego/gosec@master
-        with:
-          args: "-quiet ./..."
-          # runs in repo root by default; set working dir:
-        env:
-          GOSEC_WORK_DIR: backend/MuchToDo
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          gosec -quiet ./...
 
   build_push_deploy:
     name: Build + Image Scan + Push + Deploy
