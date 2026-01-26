@@ -138,18 +138,21 @@ func preloadUsernamesIntoCache(db *mongo.Client, cacheSvc cache.Cache, cfg confi
 	}
 
 	if len(usernamesToCache) > 0 {
-		err := cacheSvc.SetMany(ctx, usernamesToCache, usernameCacheTTL)
-		if err != nil {
+		if err := cacheSvc.SetMany(ctx, usernamesToCache, usernameCacheTTL); err != nil {
 			slog.Error("Error preloading usernames to cache", slog.Any("error", err))
-		} else {
-			// Set the sentinel key to prevent re-loading until it expires.
-			if err := cacheSvc.Set(ctx, usernameCacheSentinelKey, "true", usernameCacheTTL); err != nil {
-	slog.Warn("failed to set username cache sentinel", "key", usernameCacheSentinelKey, "err", err)
-}
+			return
+		}
 
-	} else {
-		slog.Info("No usernames found to preload.")
+		// Set the sentinel key to prevent re-loading until it expires.
+		if err := cacheSvc.Set(ctx, usernameCacheSentinelKey, "true", usernameCacheTTL); err != nil {
+			slog.Warn("failed to set username cache sentinel", "key", usernameCacheSentinelKey, "err", err)
+		}
+
+		slog.Info("Successfully preloaded usernames into cache", "count", len(usernamesToCache))
+		return
 	}
+
+	slog.Info("No usernames found to preload.")
 }
 
 // setupRouter initializes the Gin router and sets up the routes.
@@ -168,7 +171,6 @@ func setupRouter(db *mongo.Client, cfg config.Config, tokenSvc *auth.TokenServic
 
 	// Middleware
 	corsMiddleware := middleware.CORSMiddleware(cfg.AllowedOrigins)
-	// corsMiddleware := middleware.CORSMiddleware2()
 	authMiddleware := middleware.AuthMiddleware(tokenSvc, cfg)
 
 	// Apply CORS middleware to the router
@@ -203,12 +205,12 @@ func setupRouter(db *mongo.Client, cfg config.Config, tokenSvc *auth.TokenServic
 // startServer starts the HTTP server and handles graceful shutdown.
 func startServer(router *gin.Engine, port string) {
 	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: router,
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second, // gosec G112 mitigation
 	}
 
 	go func() {
-		// Service connections
 		slog.Info("Server starting", "port", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("Server listen error", slog.Any("error", err))
