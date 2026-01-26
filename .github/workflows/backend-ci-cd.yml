@@ -14,6 +14,10 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+
+env:
+  AWS_REGION: eu-west-2
 
 jobs:
   test_lint_scan:
@@ -50,11 +54,6 @@ jobs:
       - name: Run golangci-lint
         run: golangci-lint run ./... --timeout=5m
 
-      # -------------------------
-      # FIX: Gosec rule G404 is a false-positive in your case
-      # (math/rand used only for sampling cache refresh, not crypto).
-      # We exclude G404 globally to avoid pipeline failing.
-      # -------------------------
       - name: Gosec (SAST) - exclude G404
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
@@ -75,12 +74,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Using static AWS keys for now.
+      # Later you can switch to OIDC by replacing this step with role-to-assume.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Resolve AWS Account ID
         id: acct
@@ -91,12 +92,12 @@ jobs:
         run: |
           echo "sha_short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           echo "repo=${{ secrets.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
-          echo "ecr_uri=${{ steps.acct.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
+          echo "ecr_uri=${{ steps.acct.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
 
       - name: Login to ECR
         run: |
-          aws ecr get-login-password --region "${{ secrets.AWS_REGION }}" \
-            | docker login --username AWS --password-stdin "${{ steps.acct.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
+            | docker login --username AWS --password-stdin "${{ steps.acct.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
 
       - name: Build Docker image
         run: docker build -t "${{ steps.vars.outputs.repo }}:${{ steps.vars.outputs.sha_short }}" .
@@ -136,7 +137,7 @@ jobs:
           set -e
           REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
           ASG="${{ secrets.ASG_NAME }}"
-          REGION="${{ secrets.AWS_REGION }}"
+          REGION="${{ env.AWS_REGION }}"
 
           echo "Waiting for refresh $REFRESH_ID ..."
           for i in {1..60}; do
