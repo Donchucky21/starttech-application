@@ -1,0 +1,173 @@
+name: Backend CI/CD (Golang -> ECR -> ASG Rolling Update)
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci-cd.yml"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "backend/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test_lint_scan:
+    name: Test + Lint + SAST
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend/MuchToDo
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+          cache-dependency-path: backend/MuchToDo/go.sum
+
+      - name: Go test
+        run: |
+          go test ./... -v
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.60.3
+          working-directory: backend/MuchToDo
+          args: --timeout=5m
+
+      - name: Gosec (SAST)
+        uses: securego/gosec@master
+        with:
+          args: "-quiet ./..."
+          # runs in repo root by default; set working dir:
+        env:
+          GOSEC_WORK_DIR: backend/MuchToDo
+
+  build_push_deploy:
+    name: Build + Image Scan + Push + Deploy
+    runs-on: ubuntu-latest
+    needs: [ test_lint_scan ]
+    if: github.event_name != 'pull_request'
+
+    defaults:
+      run:
+        working-directory: backend/MuchToDo
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Resolve AWS Account ID
+        id: acct
+        run: echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Set vars
+        id: vars
+        run: |
+          echo "sha_short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ secrets.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
+          echo "ecr_uri=${{ steps.acct.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region "${{ secrets.AWS_REGION }}" \
+            | docker login --username AWS --password-stdin "${{ steps.acct.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+
+      - name: Build Docker image
+        run: |
+          docker build -t "${{ steps.vars.outputs.repo }}:${{ steps.vars.outputs.sha_short }}" .
+
+      - name: Tag image
+        run: |
+          docker tag "${{ steps.vars.outputs.repo }}:${{ steps.vars.outputs.sha_short }}" "${{ steps.vars.outputs.ecr_uri }}:${{ steps.vars.outputs.sha_short }}"
+          docker tag "${{ steps.vars.outputs.repo }}:${{ steps.vars.outputs.sha_short }}" "${{ steps.vars.outputs.ecr_uri }}:latest"
+
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ steps.vars.outputs.repo }}:${{ steps.vars.outputs.sha_short }}"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+
+      - name: Push to ECR
+        run: |
+          docker push "${{ steps.vars.outputs.ecr_uri }}:${{ steps.vars.outputs.sha_short }}"
+          docker push "${{ steps.vars.outputs.ecr_uri }}:latest"
+
+      - name: Start ASG Instance Refresh (rolling update)
+        id: refresh
+        run: |
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
+            --preferences MinHealthyPercentage=90,InstanceWarmup=120 \
+            --query "InstanceRefreshId" --output text)
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+          echo "Started refresh: $REFRESH_ID"
+
+      - name: Wait for Instance Refresh to complete
+        run: |
+          set -e
+          REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
+          ASG="${{ secrets.ASG_NAME }}"
+          REGION="${{ secrets.AWS_REGION }}"
+
+          echo "Waiting for refresh $REFRESH_ID ..."
+          for i in {1..60}; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG" \
+              --region "$REGION" \
+              --query "InstanceRefreshes[?InstanceRefreshId=='$REFRESH_ID'].Status | [0]" \
+              --output text)
+
+            PCT=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG" \
+              --region "$REGION" \
+              --query "InstanceRefreshes[?InstanceRefreshId=='$REFRESH_ID'].PercentageComplete | [0]" \
+              --output text)
+
+            echo "Status=$STATUS Percent=$PCT"
+
+            if [ "$STATUS" = "Successful" ]; then
+              exit 0
+            fi
+
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "Instance refresh ended with status: $STATUS"
+              exit 1
+            fi
+
+            sleep 20
+          done
+
+          echo "Timed out waiting for instance refresh"
+          exit 1
+
+      - name: Smoke test ALB /health
+        run: |
+          set -e
+          URL="${{ secrets.ALB_HEALTH_URL }}"
+          echo "Testing: $URL"
+          curl -i "$URL"
+          curl -fsS "$URL" | tee /tmp/health.json
+          cat /tmp/health.json
