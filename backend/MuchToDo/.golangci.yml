@@ -1,0 +1,10 @@
+linters:
+  enable:
+    - errcheck
+
+issues:
+  exclude-rules:
+    - path: internal/handlers/user.go
+      text: "Error return value of `.*\\.Set` is not checked"
+    - path: cmd/api/main.go
+      text: "Error return value of `.*\\.Set` is not checked"
